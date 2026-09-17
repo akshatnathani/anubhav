@@ -43,13 +43,14 @@
 <div class="card">
   <h2>Email (Google Apps Script)</h2>
   {% if not mail_configured %}
-    <p class="flash error">MAIL_SECRET is not set in .env, so Apps Script can't fetch emails.</p>
+    <p class="flash error">APPS_SCRIPT_URL is not set in .env, so emails wait here unsent.</p>
   {% endif %}
   <p class="muted">Waiting to be sent: <strong>{{ mail.pending }}</strong> ·
     Last email sent: <strong>{{ mail.last_sent|localtime if mail.last_sent else 'never' }}</strong></p>
+  {% if mail.last_error %}<p class="flash error">Last delivery error: {{ mail.last_error }}</p>{% endif %}
   <form method="post" action="{{ url_for('admin_test_email') }}" class="row" style="align-items:end">
     <div><label>Send a test email to</label><input type="email" name="email" value="{{ me.email }}" required></div>
-    <div><button type="submit" class="secondary">Queue test email</button></div>
+    <div><button type="submit" class="secondary">Send test email</button></div>
   </form>
 </div>
 {% endblock %}

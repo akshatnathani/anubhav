@@ -1,27 +1,34 @@
 """Daily accountability tracker.
 
 Admin adds members (e.g. a brother) and the things they must log every day.
-Members log in and log. Emails are not sent from here: a Google Apps Script
-polls /api/mail/outbox, sends what it finds from Gmail, and acks it.
+Members log in and log. Data lives in Supabase (Postgres). Emails are not sent
+from here: a background loop queues reminders and posts each email to a Google
+Apps Script web app, which sends it from Gmail.
 """
+import json
 import os
 import re
 import secrets
+import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
 import click
 import psycopg
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://tracker:tracker@localhost:5432/tracker")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
-MAIL_SECRET = os.environ.get("MAIL_SECRET", "")
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
+if "XXXXXXXX" in APPS_SCRIPT_URL:  # still the .env.example placeholder
+    APPS_SCRIPT_URL = ""
 CURRENCY = os.environ.get("CURRENCY", "₹")
 APP_NAME = os.environ.get("APP_NAME", "Daily Tracker")
 
@@ -133,16 +140,49 @@ CREATE TABLE IF NOT EXISTS outbox (
     sent_at TIMESTAMPTZ
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS login_sent_at TIMESTAMPTZ;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT;
+-- Supabase exposes the public schema through its REST API. With RLS on and no policies, the
+-- anon/authenticated API keys can't read or write these tables; this app's own connection
+-- (the postgres role) bypasses RLS and is unaffected.
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dsa_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE money_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE money_days ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE outbox ENABLE ROW LEVEL SECURITY;
 """
 
 
+# prepare_threshold=None: Supabase's transaction pooler (port 6543) doesn't support prepared statements.
+CONN_KWARGS = {"row_factory": dict_row, "autocommit": True, "prepare_threshold": None}
+_pool = None
+
+
+def conninfo():
+    if not DATABASE_URL:
+        raise SystemExit("Set DATABASE_URL in .env (Supabase > Connect > Session pooler)")
+    # Supabase only accepts TLS connections.
+    return DATABASE_URL if "sslmode=" in DATABASE_URL else DATABASE_URL + ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
+
+
 def connect():
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
+    return psycopg.connect(conninfo(), **CONN_KWARGS)
+
+
+def pool():
+    """A few long-lived connections: opening a TLS connection to Supabase per request is slow."""
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(conninfo(), kwargs=CONN_KWARGS, min_size=1, max_size=4, max_idle=300,
+                               check=ConnectionPool.check_connection, open=True)
+    return _pool
 
 
 def db():
     if "db" not in g:
-        g.db = connect()
+        g.db = pool().getconn()
     return g.db
 
 
@@ -150,7 +190,7 @@ def db():
 def close_db(_exc):
     conn = g.pop("db", None)
     if conn is not None:
-        conn.close()
+        pool().putconn(conn)
 
 
 def q(sql, params=None):
@@ -166,15 +206,15 @@ def q1(sql, params=None):
 @app.cli.command("init-db")
 def init_db_command():
     """Create tables (waiting for Postgres to come up) and the admin account."""
-    for _ in range(60):
+    for _ in range(30):
         try:
             conn = connect()
             break
-        except psycopg.OperationalError:
-            click.echo("waiting for database...")
+        except psycopg.OperationalError as exc:
+            click.echo(f"waiting for database... ({str(exc).strip().splitlines()[0]})")
             time.sleep(2)
     else:
-        raise SystemExit("database never became reachable")
+        raise SystemExit("Could not connect to Supabase. Check DATABASE_URL (use the Session pooler string).")
     with conn:
         conn.execute(SCHEMA)
         username = os.environ.get("ADMIN_USERNAME", "admin").lower()
@@ -597,9 +637,14 @@ def new_password():
 def queue_email(key, to, subject, body, link="", expires_at=None):
     if not to:
         return False
-    q("""INSERT INTO outbox (dedupe_key, to_email, subject, body, link, expires_at)
-         VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING""",
-      (key, to, subject, body, link, expires_at))
+    # Skip the insert when the key exists, so the minute-by-minute reminder check doesn't burn ids.
+    if q1("SELECT 1 FROM outbox WHERE dedupe_key = %s", (key,)):
+        return True
+    added = q("""INSERT INTO outbox (dedupe_key, to_email, subject, body, link, expires_at)
+                 VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING RETURNING id""",
+              (key, to, subject, body, link, expires_at))
+    if added:
+        mail_wakeup.set()  # send it now instead of at the next minute
     return True
 
 
@@ -624,9 +669,11 @@ def admin_home():
     for m in members:
         tasks = q("SELECT * FROM tasks WHERE user_id = %s AND active ORDER BY id", (m["id"],))
         summary.append({"member": m, "status": task_status(tasks, grid_days=1)})
-    mail = q1("""SELECT COUNT(*) FILTER (WHERE sent_at IS NULL AND (expires_at IS NULL OR expires_at > now())) AS pending,
-                        MAX(sent_at) AS last_sent FROM outbox""")
-    return render_template("admin_home.html", summary=summary, mail=mail, mail_configured=bool(MAIL_SECRET))
+    mail = q1(f"""SELECT COUNT(*) FILTER (WHERE {SENDABLE}) AS pending, MAX(sent_at) AS last_sent,
+                         (SELECT last_error FROM outbox WHERE sent_at IS NULL AND last_error IS NOT NULL
+                          ORDER BY id DESC LIMIT 1) AS last_error
+                  FROM outbox""")
+    return render_template("admin_home.html", summary=summary, mail=mail, mail_configured=bool(APPS_SCRIPT_URL))
 
 
 @app.route("/admin/members", methods=["POST"])
@@ -690,10 +737,9 @@ def admin_send_login(member_id):
     if password is None:
         password = new_password()
         q("UPDATE users SET password_hash = %s WHERE id = %s", (generate_password_hash(password), member_id))
-    queue_login_email(member, password)
     q("UPDATE users SET login_sent_at = now() WHERE id = %s", (member_id,))
-    flash(f"Login email queued for {member['email']} (password: {password}). "
-          "It goes out on the next Apps Script run.", "ok")
+    queue_login_email(member, password)
+    flash(f"Login email for {member['email']} is on its way (password: {password}).", "ok")
     return redirect(url_for("admin_member", member_id=member_id))
 
 
@@ -766,19 +812,15 @@ def admin_test_email():
     else:
         queue_email(f"test:{secrets.token_hex(6)}", to, f"{APP_NAME}: test email",
                     "If you can read this, the Apps Script mailer is working.", f"{BASE_URL}/")
-        flash(f"Test email queued for {to}. It goes out on the next Apps Script run.", "ok")
+        flash(f"Test email to {to} is on its way. Refresh in a few seconds to see if it was sent.", "ok")
     return redirect(url_for("admin_home"))
 
 
-# ---------------------------------------------------------------- mail API (polled by Google Apps Script)
+# ---------------------------------------------------------------- email delivery (via Google Apps Script web app)
 
-
-def require_mail_secret():
-    if not MAIL_SECRET:
-        abort(503, "MAIL_SECRET is not set on the server")
-    given = request.headers.get("X-Mail-Secret") or request.args.get("secret", "")
-    if not secrets.compare_digest(given, MAIL_SECRET):
-        abort(401)
+MAX_ATTEMPTS = 10
+SENDABLE = f"sent_at IS NULL AND attempts < {MAX_ATTEMPTS} AND (expires_at IS NULL OR expires_at > now())"
+mail_wakeup = threading.Event()
 
 
 def queue_due_reminders():
@@ -806,26 +848,59 @@ def queue_due_reminders():
         )
 
 
-@app.route("/api/mail/outbox")
-def mail_outbox():
-    require_mail_secret()
-    queue_due_reminders()
-    rows = q("""SELECT id, to_email, subject, body, link FROM outbox
-                WHERE sent_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-                ORDER BY id LIMIT 50""")
-    return jsonify({"messages": [
-        {"id": r["id"], "to": r["to_email"], "subject": r["subject"], "body": r["body"], "link": r["link"]}
-        for r in rows
-    ]})
+def post_to_apps_script(msg):
+    payload = json.dumps({"to": msg["to_email"], "subject": msg["subject"], "body": msg["body"],
+                          "link": msg["link"]}).encode()
+    req = urllib.request.Request(APPS_SCRIPT_URL, data=payload, headers={"Content-Type": "application/json"})
+    # Apps Script answers a POST with a redirect to the result; urllib follows it with a GET.
+    with urllib.request.urlopen(req, timeout=30) as res:
+        text_body = res.read().decode("utf-8", "replace")
+    try:
+        result = json.loads(text_body)
+    except ValueError:
+        raise RuntimeError("Apps Script didn't return JSON. Is the web app deployed with access 'Anyone'? "
+                           + re.sub(r"\s+", " ", text_body)[:150])
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "Apps Script reported a failure")
 
 
-@app.route("/api/mail/ack", methods=["POST"])
-def mail_ack():
-    require_mail_secret()
-    ids = [int(i) for i in (request.get_json(silent=True) or {}).get("ids", []) if str(i).isdigit()]
-    if ids:
-        q("UPDATE outbox SET sent_at = now() WHERE id = ANY(%s) AND sent_at IS NULL", (ids,))
-    return jsonify({"acked": len(ids)})
+def deliver_outbox():
+    """Send every waiting email. Each row is claimed atomically, so running this twice never double-sends."""
+    tried = [0]
+    while True:
+        msg = q1(f"""UPDATE outbox SET sent_at = now(), attempts = attempts + 1
+                     WHERE id = (SELECT id FROM outbox WHERE {SENDABLE} AND id <> ALL(%s)
+                                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+                     RETURNING *""", (tried,))
+        if msg is None:
+            return
+        tried.append(msg["id"])
+        try:
+            post_to_apps_script(msg)
+            q("UPDATE outbox SET last_error = NULL WHERE id = %s", (msg["id"],))
+            app.logger.info("mailer: sent #%s to %s", msg["id"], msg["to_email"])
+        except Exception as exc:
+            q("UPDATE outbox SET sent_at = NULL, last_error = %s WHERE id = %s", (str(exc)[:500], msg["id"]))
+            app.logger.warning("mailer: #%s failed (attempt %s): %s", msg["id"], msg["attempts"], exc)
+
+
+def mailer_loop():
+    if not APPS_SCRIPT_URL:
+        app.logger.warning("mailer: APPS_SCRIPT_URL is not set, emails will wait in the outbox")
+    while True:
+        try:
+            with app.app_context():
+                queue_due_reminders()
+                if APPS_SCRIPT_URL:
+                    deliver_outbox()
+        except Exception as exc:
+            app.logger.warning("mailer: %s", exc)
+        mail_wakeup.wait(60)  # check every minute, or right away when an email is queued
+        mail_wakeup.clear()
+
+
+def start_mailer():
+    threading.Thread(target=mailer_loop, name="mailer", daemon=True).start()
 
 
 @app.route("/healthz")

@@ -1,43 +1,14 @@
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: tracker
-      POSTGRES_USER: tracker
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-    # Tuned for a tiny VM: ~30-50 MB RAM idle.
-    command: >
-      postgres
-      -c shared_buffers=24MB
-      -c work_mem=2MB
-      -c maintenance_work_mem=16MB
-      -c max_connections=20
-      -c effective_cache_size=64MB
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    mem_limit: 160m
-
   app:
     build: .
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://tracker:${POSTGRES_PASSWORD}@db:5432/tracker
+    env_file: .env          # DATABASE_URL points at Supabase
     ports:
       - "${PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
-      interval: 30s
-      timeout: 5s
+      interval: 60s
+      timeout: 10s
       retries: 3
     mem_limit: 160m
 
@@ -50,6 +21,3 @@ services:
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
       - app
-
-volumes:
-  pgdata:
