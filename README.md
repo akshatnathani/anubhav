@@ -16,9 +16,14 @@ A small website where you (admin) add your brother, set the things he must log e
   config, never in code or the browser.
 - **Google Apps Script** (`apps-script/Code.gs`), deployed as a web app, sends the emails from your Gmail.
 
-> **Plan:** Python Workers are much heavier than JavaScript. The **Free plan's 10 ms CPU limit** per request is
-> very likely to fail (error 1102), especially on login, which runs PBKDF2. Use **Workers Paid ($5/month)**.
-> Python Workers + Hyperdrive support is in beta (Sept 2026).
+> **Plan:** Python Workers are heavier than JavaScript ones — pages measured 20-27 ms CPU, above the Free
+> plan's 10 ms limit, so **Workers Paid ($5/month)** is the safe choice. Python Workers + Hyperdrive are in
+> beta (Sept 2026).
+>
+> **Cloudflare cron is unreliable right now.** On Free-plan accounts the trigger registers but is never
+> dispatched (widely reported since 2026-09-15, and confirmed on this Worker: zero scheduled invocations).
+> The reminders therefore also have a backup timer in the Apps Script that calls `/api/run-jobs` every
+> 5 minutes. Both paths are safe to run together — each email is claimed once.
 
 ## One-time setup
 
@@ -47,6 +52,7 @@ Paste the returned `id` into `wrangler.jsonc` → `hyperdrive[0].id`.
 ```bash
 npx wrangler secret put SECRET_KEY        # long random string (from .env)
 npx wrangler secret put APPS_SCRIPT_URL   # Apps Script web app URL (from .env)
+npx wrangler secret put JOBS_SECRET       # random string; guards /api/run-jobs (from .env)
 ```
 
 ### 3. Deploy
@@ -65,6 +71,9 @@ It prints `https://anubhav-tracker.<you>.workers.dev`. Put that (or your custom 
 2. Run **`authorize`** once and allow permissions ("unverified app" → Advanced → continue).
 3. **Deploy → New deployment → Web app**, *Execute as:* **Me**, *Who has access:* **Anyone**.
 4. The web app URL is the `APPS_SCRIPT_URL` secret. **Keep it private:** anyone with it can send email as you.
+5. **Backup timer for reminders** (recommended while Cloudflare's cron is broken): in **Project Settings →
+   Script Properties** add `JOBS_URL` = `https://<your worker>/api/run-jobs?key=<JOBS_SECRET>`, then run
+   **`setupTrigger`** once. It calls the Worker every 5 minutes.
 
 After editing `Code.gs`: **Deploy → Manage deployments → edit → Version: New version** (same URL).
 
@@ -82,7 +91,7 @@ After editing `Code.gs`: **Deploy → Manage deployments → edit → Version: N
 4. **Send test email** on the Members page checks the Apps Script link.
 
 ### How reminders work
-- The cron runs every minute. For each member whose login has been sent, tasks whose reminder time has
+- The cron (and the Apps Script backup timer) runs `/api/run-jobs`. For each member whose login has been sent, tasks whose reminder time has
   passed and that **aren't logged yet today** get one email listing them.
 - One email per reminder time per day. Unsent reminders expire at midnight. Failed sends retry every minute
   (up to 10 times), and the last error shows on the admin page.
@@ -94,6 +103,7 @@ cp .dev.vars.example .dev.vars
 # point wrangler.jsonc hyperdrive.localConnectionString at a local Postgres, then:
 npm run dev                       # http://localhost:8787 (first request is slow while Python boots)
 curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"   # run the cron once
+curl -X POST "http://localhost:8787/api/run-jobs?key=$JOBS_SECRET"     # same work over HTTP
 ```
 
 ## Notes

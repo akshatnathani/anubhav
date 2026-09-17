@@ -10,14 +10,14 @@
     "APP_NAME": "Anubhav's Tracker",
     "TIMEZONE": "Asia/Kolkata",
     "CURRENCY": "₹",
-    "BASE_URL": "https://anubhav-tracker.YOUR-SUBDOMAIN.workers.dev"
+    "BASE_URL": "https://anubhav-tracker.anubhav-tracker.workers.dev"
   },
 
   // Supabase through Hyperdrive. Create with caching disabled (see README), then paste the id here.
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      "id": "00000000000000000000000000000000",
+      "id": "70a77b542fb84771acc6c3f95ba26623",
       "localConnectionString": "postgresql://postgres:pw@localhost:5433/postgres"
     }
   ],

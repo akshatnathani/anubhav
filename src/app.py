@@ -913,17 +913,19 @@ def post_to_apps_script(msg):
 def deliver_outbox():
     """Send every waiting email. Each row is claimed atomically, so running this twice never double-sends."""
     tried = [0]
+    sent = 0
     while True:
         msg = q1(f"""UPDATE outbox SET sent_at = now(), attempts = attempts + 1
                      WHERE id = (SELECT id FROM outbox WHERE {SENDABLE} AND id <> ALL(%s)
                                  ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
                      RETURNING *""", (tried,))
         if msg is None:
-            return
+            return sent
         tried.append(msg["id"])
         try:
             post_to_apps_script(msg)
             q("UPDATE outbox SET last_error = NULL WHERE id = %s", (msg["id"],))
+            sent += 1
             app.logger.info("mailer: sent #%s to %s", msg["id"], msg["to_email"])
         except Exception as exc:
             q("UPDATE outbox SET sent_at = NULL, last_error = %s WHERE id = %s", (str(exc)[:500], msg["id"]))
@@ -945,6 +947,20 @@ def send_now():
             deliver_outbox()
         except Exception as exc:
             app.logger.warning("mailer: %s", exc)
+
+
+@app.route("/api/run-jobs", methods=["GET", "POST"])
+def api_run_jobs():
+    """Queue due reminders and send queued email. Called by the Cloudflare cron and, as a backup that
+    doesn't depend on Cloudflare's cron actually firing, by a time trigger in the Apps Script."""
+    secret = setting("JOBS_SECRET")
+    given = request.headers.get("X-Jobs-Secret") or request.args.get("key", "")
+    if not secret or not secrets.compare_digest(given, secret):
+        abort(401)
+    queue_due_reminders()
+    sent = deliver_outbox() if APPS_SCRIPT_URL else 0
+    waiting = q1(f"SELECT COUNT(*) AS n FROM outbox WHERE {SENDABLE}")["n"]
+    return {"ok": True, "sent": sent, "waiting": waiting}
 
 
 @app.route("/healthz")

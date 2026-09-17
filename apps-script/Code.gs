@@ -38,6 +38,29 @@ function authorize() {
   Logger.log('Emails left today: ' + MailApp.getRemainingDailyQuota());
 }
 
+/**
+ * Backup timer for the reminders, because Cloudflare's own cron triggers are unreliable
+ * on Free-plan accounts (registered but never dispatched).
+ *
+ * Project Settings > Script Properties:  JOBS_URL = https://<your worker>/api/run-jobs?key=<JOBS_SECRET>
+ * Then run setupTrigger() once.
+ */
+function setupTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'runJobs') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('runJobs').timeBased().everyMinutes(5).create();
+  Logger.log('Trigger created: runJobs() runs every 5 minutes.');
+  runJobs();
+}
+
+function runJobs() {
+  const url = PropertiesService.getScriptProperties().getProperty('JOBS_URL');
+  if (!url) throw new Error('Set JOBS_URL in Project Settings > Script Properties.');
+  const res = UrlFetchApp.fetch(url, { method: 'post', muteHttpExceptions: true });
+  Logger.log('run-jobs -> ' + res.getResponseCode() + ' ' + res.getContentText().slice(0, 200));
+}
+
 function json_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
