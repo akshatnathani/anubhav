@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Members</h1>
+<p class="sub">Add someone, give them things to log every day, and send them their login.</p>
+
+{% for s in summary %}
+{% set m = s.member %}{% set done_n = s.status|selectattr('done')|list|length %}
+<div class="card">
+  <div class="head">
+    <div>
+      <strong>{{ m.name }}</strong> <span class="muted">@{{ m.username }} · {{ m.email }}</span>
+      {% if not m.active %}<span class="pill off">disabled</span>{% endif %}
+      {% if not m.login_sent_at %}<span class="pill pending">login not sent · no reminders yet</span>{% endif %}
+      <div class="muted">
+        {% if not s.status %}No tasks yet.
+        {% else %}Today: {{ done_n }}/{{ s.status|length }} logged —
+          {% for st in s.status %}{{ st.task.name }} {% if st.done %}✅{% else %}⏳{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+        {% endif %}
+      </div>
+    </div>
+    <a class="btn small" href="{{ url_for('admin_member', member_id=m.id) }}">Manage</a>
+  </div>
+</div>
+{% else %}
+<div class="card muted">No members yet. Add your brother below.</div>
+{% endfor %}
+
+<div class="card">
+  <h2>Add a member</h2>
+  <form method="post" action="{{ url_for('admin_create_member') }}">
+    <div class="row">
+      <div><label>Name</label><input type="text" name="name" placeholder="Anubhav" required></div>
+      <div><label>Email</label><input type="email" name="email" required></div>
+    </div>
+    <div class="row">
+      <div><label>Username</label><input type="text" name="username" autocapitalize="none" pattern="[a-z0-9_.\-]{3,30}" required></div>
+      <div><label>Password <span class="hint">blank = generate one</span></label><input type="text" name="password" minlength="6"></div>
+    </div>
+    <button type="submit">Add member</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Email (Google Apps Script)</h2>
+  {% if not mail_configured %}
+    <p class="flash error">MAIL_SECRET is not set in .env, so Apps Script can't fetch emails.</p>
+  {% endif %}
+  <p class="muted">Waiting to be sent: <strong>{{ mail.pending }}</strong> ·
+    Last email sent: <strong>{{ mail.last_sent|localtime if mail.last_sent else 'never' }}</strong></p>
+  <form method="post" action="{{ url_for('admin_test_email') }}" class="row" style="align-items:end">
+    <div><label>Send a test email to</label><input type="email" name="email" value="{{ me.email }}" required></div>
+    <div><button type="submit" class="secondary">Queue test email</button></div>
+  </form>
+</div>
+{% endblock %}

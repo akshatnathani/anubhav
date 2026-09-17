@@ -1,0 +1,7 @@
+<div class="grid" role="img" aria-label="Daily history">
+  {% for c in grid %}<div class="cell {{ c.state }}" title="{{ c.day.strftime('%d %b') }}: {{ c.state }}"></div>{% endfor %}
+</div>
+<div class="legend">
+  <span><i class="cell done"></i>Done</span><span><i class="cell missed"></i>Missed</span>
+  <span><i class="cell pending"></i>Today, pending</span><span><i class="cell"></i>Not tracked</span>
+</div>

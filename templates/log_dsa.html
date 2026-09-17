@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ task.name }}</h1>
+<p class="sub">Target: {{ task.min_count }} problem(s) today. Logged so far: {{ logs|length }}.
+  {% if task.description %}<br>{{ task.description }}{% endif %}</p>
+
+{% for log in logs %}
+<div class="card"><details><summary>✅ {{ log.problem }} · {{ log.difficulty }} · {{ log.topic }}</summary>
+  <p class="muted">{{ log.outcome }} · {{ log.minutes }} min · logged {{ log.created_at|localtime }}</p>
+  <p><strong>Approach:</strong> {{ log.approach }}</p>
+  <p><strong>Complexity:</strong> {{ log.complexity }}</p>
+  <p><strong>Learnings:</strong> {{ log.mistakes }}</p>
+</details></div>
+{% endfor %}
+
+<div class="card">
+<h2>Log a problem</h2>
+{% if errors %}<ul class="errors">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+<form method="post">
+  <div class="row">
+    <div><label>Problem name</label><input type="text" name="problem" value="{{ form.problem }}" required></div>
+    <div><label>Link</label><input type="url" name="link" value="{{ form.link }}" placeholder="https://leetcode.com/problems/..." required></div>
+  </div>
+  <div class="row">
+    <div><label>Topic</label><select name="topic" required><option value="">—</option>
+      {% for t in topics %}<option {% if form.topic == t %}selected{% endif %}>{{ t }}</option>{% endfor %}</select></div>
+    <div><label>Difficulty</label><select name="difficulty" required><option value="">—</option>
+      {% for d in difficulties %}<option {% if form.difficulty == d %}selected{% endif %}>{{ d }}</option>{% endfor %}</select></div>
+    <div><label>Time spent (min)</label><input type="number" name="minutes" min="5" max="600" value="{{ form.minutes }}" required></div>
+  </div>
+  <label>How did it go? <span class="hint">be honest</span></label>
+  <select name="outcome" required><option value="">—</option>
+    {% for o in outcomes %}<option {% if form.outcome == o %}selected{% endif %}>{{ o }}</option>{% endfor %}</select>
+  <label>Explain your approach <span class="hint">in your own words, as if teaching a friend: the idea, why it works, edge cases</span></label>
+  <textarea name="approach" data-min="200" required>{{ form.approach }}</textarea>
+  <label>Complexity <span class="hint">e.g. Time O(n log n), Space O(n)</span></label>
+  <input type="text" name="complexity" value="{{ form.complexity }}" required>
+  <label>Mistakes &amp; learnings <span class="hint">what tripped you up? what pattern will you remember?</span></label>
+  <textarea name="mistakes" data-min="60" required>{{ form.mistakes }}</textarea>
+  <label>Your code <span class="hint">optional</span></label>
+  <textarea name="code" class="code">{{ form.code }}</textarea>
+  <button type="submit">Save log</button>
+</form>
+</div>
+{% endblock %}

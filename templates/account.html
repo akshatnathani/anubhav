@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Account</h1>
+<p class="sub">Signed in as <strong>{{ me.username }}</strong>{% if me.email %} · {{ me.email }}{% endif %}</p>
+<div class="card" style="max-width:420px">
+  <h2>Change password</h2>
+  <form method="post">
+    <label>Current password</label><input type="password" name="current" autocomplete="current-password" required>
+    <label>New password</label><input type="password" name="new" minlength="6" autocomplete="new-password" required>
+    <button type="submit">Change password</button>
+  </form>
+</div>
+{% endblock %}

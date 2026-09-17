@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="muted"><a href="{{ url_for('admin_home') }}">← Members</a></p>
+<div class="head">
+  <div><h1>{{ member.name }}</h1><p class="sub">@{{ member.username }} · {{ member.email }}</p></div>
+  <a class="btn secondary small" href="{{ url_for('history', member=member.id) }}">View their logs →</a>
+</div>
+
+<div class="card">
+  <h2>1. Things {{ member.name }} must log every day</h2>
+  {% for t in tasks %}{% set st = status.get(t.id) %}
+  <details class="card" style="background:var(--bg)">
+    <summary>
+      {{ t.name }} <span class="muted">· {{ kinds[t.kind] }}{% if t.kind != 'money' %} · {{ t.min_count }}/day{% endif %} · reminder {{ t.remind_at }}</span>
+      {% if not t.active %}<span class="pill off">paused</span>
+      {% elif st and st.done %}<span class="pill done">✓ today</span>
+      {% else %}<span class="pill pending">not yet today</span>{% endif %}
+      {% if st %}<span class="muted">🔥 {{ st.streak }}</span>{% endif %}
+    </summary>
+    <form method="post" action="{{ url_for('admin_update_task', task_id=t.id) }}">
+      <div class="row">
+        <div><label>Name</label><input type="text" name="name" value="{{ t.name }}" required></div>
+        <div><label>Reminder time <span class="hint">emailed only if not logged</span></label><input type="time" name="remind_at" value="{{ t.remind_at }}" required></div>
+        {% if t.kind != 'money' %}<div><label>Logs per day</label><input type="number" name="min_count" min="1" max="20" value="{{ t.min_count }}" required></div>
+        {% else %}<input type="hidden" name="min_count" value="1">{% endif %}
+      </div>
+      <label>Instructions for them <span class="hint">optional</span></label>
+      <input type="text" name="description" value="{{ t.description }}">
+      <label class="check"><input type="checkbox" name="active" {% if t.active %}checked{% endif %}> Active</label>
+      <button type="submit" name="action" value="save">Save</button>
+    </form>
+    <form method="post" action="{{ url_for('admin_update_task', task_id=t.id) }}" data-confirm="Delete '{{ t.name }}' and ALL its logs?">
+      <button type="submit" name="action" value="delete" class="danger small" style="margin-top:.6rem">Delete task</button>
+    </form>
+  </details>
+  {% else %}
+  <p class="muted">Nothing yet. Add the first one below.</p>
+  {% endfor %}
+
+  <h2 style="margin-top:1.2rem">Add something to log</h2>
+  <form method="post" action="{{ url_for('admin_add_task', member_id=member.id) }}">
+    <div class="row">
+      <div><label>Name</label><input type="text" name="name" placeholder="DSA practice / Money log / Gym" required></div>
+      <div><label>Type</label><select name="kind">
+        <option value="dsa">DSA problems (detailed problem log)</option>
+        <option value="money">Money log (transactions + close the day)</option>
+        <option value="generic">General task (what I did + details)</option></select></div>
+    </div>
+    <div class="row">
+      <div><label>Reminder time <span class="hint">emailed only if not logged</span></label><input type="time" name="remind_at" value="19:00" required></div>
+      <div><label>Logs per day <span class="hint">ignored for money</span></label><input type="number" name="min_count" min="1" max="20" value="1" required></div>
+    </div>
+    <label>Instructions for them <span class="hint">optional, e.g. "2 mediums from Striver's sheet"</span></label>
+    <input type="text" name="description">
+    <button type="submit">Add</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>2. Send login email</h2>
+  {% if fresh_password %}
+    <p>Password set when you created them: <code>{{ fresh_password }}</code>. The email will include it.</p>
+  {% else %}
+    <p class="muted">This generates a <strong>new password</strong> and emails it with the website link and username.</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('admin_send_login', member_id=member.id) }}"
+        {% if not fresh_password %}data-confirm="This resets {{ member.name }}'s password. Continue?"{% endif %}>
+    <button type="submit">Email login details to {{ member.email }}</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Details</h2>
+  <form method="post">
+    <div class="row">
+      <div><label>Name</label><input type="text" name="name" value="{{ member.name }}" required></div>
+      <div><label>Email</label><input type="email" name="email" value="{{ member.email }}" required></div>
+    </div>
+    <label class="check"><input type="checkbox" name="active" {% if member.active %}checked{% endif %}> Active (can log in and gets reminders)</label>
+    <button type="submit" class="secondary">Save details</button>
+  </form>
+  <form method="post" action="{{ url_for('admin_delete_member', member_id=member.id) }}" data-confirm="Delete {{ member.name }} and ALL their logs? This cannot be undone.">
+    <button type="submit" class="danger small" style="margin-top:1rem">Delete member</button>
+  </form>
+</div>
+{% endblock %}

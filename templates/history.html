@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{% if me.is_admin %}{{ member.name }}'s history{% else %}History{% endif %}</h1>
+<p class="sub">Last 90 days.{% if me.is_admin %} <a href="{{ url_for('admin_member', member_id=member.id) }}">← back to {{ member.name }}</a>{% endif %}</p>
+<div class="tabs">{% for t in tasks %}<a class="btn small {% if not task or t.id != task.id %}secondary{% endif %}"
+   href="{{ url_for('history', task=t.id, member=member.id if me.is_admin else None) }}">{{ t.name }}{% if not t.active %} (paused){% endif %}</a>{% endfor %}</div>
+
+{% if not task %}<p class="muted">No tasks yet.</p>{% else %}
+<div class="card">
+  <div class="head"><strong>{{ task.name }}</strong><span class="muted">🔥 {{ data.status.streak }}-day streak</span></div>
+  {% with grid=data.status.grid %}{% include "_grid.html" %}{% endwith %}
+</div>
+
+{% if task.kind == 'dsa' %}
+<div class="card stats">
+  <div class="stat"><div class="k">Problems (all time)</div><div class="v">{{ data.stats.n }}</div></div>
+  <div class="stat"><div class="k">Hours</div><div class="v">{{ '%.1f'|format(data.stats.mins / 60) }}</div></div>
+  <div class="stat"><div class="k">Solved with no help</div><div class="v">{{ data.stats.own }}</div></div>
+</div>
+{% if data.topics %}<div class="card"><div class="k muted">Topics</div>
+  {% for t in data.topics %}<span class="pill" style="border:1px solid var(--line);margin:.15rem">{{ t.topic }} · {{ t.n }}</span>{% endfor %}</div>{% endif %}
+{% for log in data.logs %}
+<div class="card"><details><summary>{{ log.day.strftime('%d %b') }} · {{ log.problem }} · {{ log.difficulty }} · {{ log.topic }}</summary>
+  <p class="muted">{{ log.outcome }} · {{ log.minutes }} min · <a href="{{ log.link }}" rel="noopener" target="_blank">problem</a> · logged {{ log.created_at|localtime }}</p>
+  <p><strong>Approach:</strong> {{ log.approach }}</p>
+  <p><strong>Complexity:</strong> {{ log.complexity }}</p>
+  <p><strong>Learnings:</strong> {{ log.mistakes }}</p>
+  {% if log.code %}<pre>{{ log.code }}</pre>{% endif %}
+</details></div>
+{% else %}<p class="muted">Nothing logged yet.</p>{% endfor %}
+
+{% elif task.kind == 'money' %}
+{% if data.by_category %}
+{% set top = data.by_category[0].total %}
+<div class="card"><h2>Spending by category <span class="muted">(last 30 days)</span></h2>
+  {% for c in data.by_category %}
+  <div style="margin:.45rem 0">
+    <div class="head"><span>{{ c.category }}</span><strong>{{ c.total|money }}</strong></div>
+    <div class="progress" style="margin-top:.25rem"><div style="width:{{ (100 * c.total / top)|round }}%;background:var(--accent)"></div></div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+<div class="card table-wrap"><table>
+  <tr><th>Day</th><th>Type</th><th>Amount</th><th>Category</th><th>Note</th></tr>
+  {% for e in data.logs %}
+  <tr><td>{{ e.day.strftime('%d %b') }}</td><td>{{ e.direction }}{% if e.need_or_want %} ({{ e.need_or_want }}){% endif %}</td>
+      <td>{{ e.amount|money }}</td><td>{{ e.category }}</td><td>{{ e.note }}</td></tr>
+  {% else %}<tr><td colspan="5" class="muted">No transactions yet.</td></tr>{% endfor %}
+</table></div>
+{% for d in data.days %}
+<div class="card"><strong>{{ d.day.strftime('%d %b') }}</strong>{% if d.no_transactions %} <span class="muted">(no transactions)</span>{% endif %}
+  <p style="margin:.3rem 0 0">{{ d.reflection }}</p></div>
+{% endfor %}
+
+{% else %}
+{% for log in data.logs %}
+<div class="card"><details><summary>{{ log.day.strftime('%d %b') }} · {{ log.summary }}</summary>
+  <p class="muted">{{ log.minutes }} min · logged {{ log.created_at|localtime }}</p>
+  <p>{{ log.details }}</p>
+  {% if log.proof %}<p><a href="{{ log.proof }}" rel="noopener" target="_blank">Proof</a></p>{% endif %}
+  {% if log.blockers %}<p><strong>Blockers:</strong> {{ log.blockers }}</p>{% endif %}
+</details></div>
+{% else %}<p class="muted">Nothing logged yet.</p>{% endfor %}
+{% endif %}
+{% endif %}
+{% endblock %}

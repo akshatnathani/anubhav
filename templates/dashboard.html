@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+{% set done_n = rows|selectattr('done')|list|length %}
+<h1>Hi {{ me.name }} 👋</h1>
+<p class="sub">{{ today.strftime('%A, %d %B') }} ·
+  {% if not rows %}Nothing assigned yet.
+  {% elif done_n == rows|length %}Everything is logged for today. 🎉
+  {% else %}{{ rows|length - done_n }} of {{ rows|length }} still to log today.{% endif %}</p>
+{% if rows %}<div class="progress" style="margin:-.4rem 0 1.2rem"><div style="width:{{ (100 * done_n / rows|length)|round }}%"></div></div>{% endif %}
+
+{% for r in rows %}
+<div class="card">
+  <div class="head">
+    <div>
+      <strong>{{ r.task.name }}</strong>
+      {% if r.done %}<span class="pill done">✓ Done</span>
+      {% else %}<span class="pill pending">{{ r.count }}/{{ r.required }} logged</span>{% endif %}
+      <div class="muted">🔥 {{ r.streak }}-day streak · reminder at {{ r.task.remind_at }}</div>
+      {% if r.task.description %}<div class="muted">{{ r.task.description }}</div>{% endif %}
+    </div>
+    <a class="btn {% if r.done %}secondary{% endif %}" style="margin-top:0" href="{{ url_for('log_task', task_id=r.task.id) }}">
+      {% if r.done %}View / add more{% else %}Log now{% endif %}</a>
+  </div>
+  {% with grid=r.grid %}{% include "_grid.html" %}{% endwith %}
+</div>
+{% endfor %}
+{% endblock %}

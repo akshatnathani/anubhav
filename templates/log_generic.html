@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ task.name }}</h1>
+<p class="sub">Target: {{ task.min_count }} log(s) today. Logged so far: {{ logs|length }}.
+  {% if task.description %}<br>{{ task.description }}{% endif %}</p>
+
+{% for log in logs %}
+<div class="card"><details><summary>✅ {{ log.summary }}</summary>
+  <p class="muted">{{ log.minutes }} min · logged {{ log.created_at|localtime }}</p>
+  <p>{{ log.details }}</p>
+  {% if log.proof %}<p><a href="{{ log.proof }}" rel="noopener" target="_blank">Proof</a></p>{% endif %}
+  {% if log.blockers %}<p><strong>Blockers:</strong> {{ log.blockers }}</p>{% endif %}
+</details></div>
+{% endfor %}
+
+<div class="card">
+{% if errors %}<ul class="errors">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+<form method="post">
+  <div class="row">
+    <div><label>One-line summary</label><input type="text" name="summary" value="{{ form.summary }}" required></div>
+    <div><label>Time spent (min)</label><input type="number" name="minutes" min="5" max="720" value="{{ form.minutes }}" required></div>
+  </div>
+  <label>What exactly did you do? <span class="hint">what you worked on, what you finished, what you learned</span></label>
+  <textarea name="details" data-min="150" required>{{ form.details }}</textarea>
+  <label>Proof link <span class="hint">optional: commit, doc, screenshot</span></label>
+  <input type="url" name="proof" value="{{ form.proof }}">
+  <label>Blockers <span class="hint">optional</span></label>
+  <input type="text" name="blockers" value="{{ form.blockers }}">
+  <button type="submit">Save log</button>
+</form>
+</div>
+{% endblock %}

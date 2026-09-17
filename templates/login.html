@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:380px;margin:3.5rem auto;">
+  <h1>{{ app_name }}</h1>
+  <p class="sub">Log in to record today's progress.</p>
+  <form method="post">
+    <label for="username">Username</label>
+    <input type="text" id="username" name="username" autocapitalize="none" autocomplete="username" autofocus required>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autocomplete="current-password" required>
+    <button type="submit" style="width:100%">Log in</button>
+  </form>
+</div>
+{% endblock %}
