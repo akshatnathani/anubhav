@@ -1,36 +1,76 @@
-"""Daily accountability tracker.
+"""Daily accountability tracker, running as a Cloudflare Python Worker.
 
-Admin adds members (e.g. a brother) and the things they must log every day.
-Members log in and log. Data lives in Supabase (Postgres). Emails are not sent
-from here: a background loop queues reminders and posts each email to a Google
-Apps Script web app, which sends it from Gmail.
+Admin adds members (e.g. a brother) and the things they must log every day. Members log in and log.
+Data lives in Supabase Postgres, reached through Cloudflare Hyperdrive. A cron trigger queues reminders
+for anything not logged yet and posts each email to a Google Apps Script web app, which sends it from Gmail.
+
+The same module also runs locally with plain CPython for one-off setup:  python src/app.py init-db
 """
+import hashlib
 import json
 import os
 import re
 import secrets
-import threading
-import time
+import sys
 import urllib.request
 from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
-import click
-import psycopg
+import pg8000.dbapi
 from flask import Flask, abort, flash, g, redirect, render_template, request, session, url_for
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
-APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
-if "XXXXXXXX" in APPS_SCRIPT_URL:  # still the .env.example placeholder
-    APPS_SCRIPT_URL = ""
-CURRENCY = os.environ.get("CURRENCY", "₹")
-APP_NAME = os.environ.get("APP_NAME", "Daily Tracker")
+IN_WORKER = sys.platform == "emscripten"
+
+if IN_WORKER and not hasattr(hashlib, "pbkdf2_hmac"):
+    # Pyodide ships without OpenSSL, so hashlib.pbkdf2_hmac is missing. pg8000's SCRAM login and Werkzeug's
+    # password hashing both need it; the Workers runtime has a native PBKDF2 in WebCrypto, so use that.
+    def _webcrypto_pbkdf2_hmac(hash_name, password, salt, iterations, dklen=None):
+        from js import Object, Uint8Array, crypto
+        from pyodide.ffi import run_sync, to_js
+
+        algo = {"sha1": "SHA-1", "sha256": "SHA-256", "sha384": "SHA-384", "sha512": "SHA-512"}[
+            hash_name.lower().replace("-", "")]
+        dklen = dklen or {"SHA-1": 20, "SHA-256": 32, "SHA-384": 48, "SHA-512": 64}[algo]
+        key = run_sync(crypto.subtle.importKey("raw", to_js(bytes(password)), "PBKDF2", False, to_js(["deriveBits"])))
+        params = to_js({"name": "PBKDF2", "hash": algo, "salt": to_js(bytes(salt)), "iterations": iterations},
+                       dict_converter=Object.fromEntries)
+        bits = run_sync(crypto.subtle.deriveBits(params, key, dklen * 8))
+        return bytes(Uint8Array.new(bits).to_py())
+
+    hashlib.pbkdf2_hmac = _webcrypto_pbkdf2_hmac
+
+# Settings come from Worker vars/secrets (wrangler.jsonc, `wrangler secret put`) or, locally, the environment.
+WORKER_ENV = None
+TZ = ZoneInfo("Asia/Kolkata")
+BASE_URL = ""
+APPS_SCRIPT_URL = ""
+CURRENCY = "₹"
+APP_NAME = "Daily Tracker"
+
+
+def setting(name, default=""):
+    value = getattr(WORKER_ENV, name, None) if WORKER_ENV is not None else None
+    if value is None:
+        value = os.environ.get(name, default)
+    return str(value).strip()
+
+
+def configure(env=None):
+    """Load settings. Called with the Worker env on every request / cron run (cheap; bindings don't change)."""
+    global WORKER_ENV, TZ, BASE_URL, APPS_SCRIPT_URL, CURRENCY, APP_NAME
+    WORKER_ENV = env
+    TZ = ZoneInfo(setting("TIMEZONE", "Asia/Kolkata"))
+    BASE_URL = setting("BASE_URL").rstrip("/")
+    APPS_SCRIPT_URL = setting("APPS_SCRIPT_URL")
+    if "XXXXXXXX" in APPS_SCRIPT_URL:  # still the example placeholder
+        APPS_SCRIPT_URL = ""
+    CURRENCY = setting("CURRENCY", "₹")
+    APP_NAME = setting("APP_NAME", "Daily Tracker")
+    app.secret_key = setting("SECRET_KEY") or app.secret_key or secrets.token_hex(32)
+
 
 DSA_TOPICS = [
     "Arrays", "Strings", "Hashing", "Two Pointers", "Sliding Window", "Binary Search",
@@ -47,7 +87,7 @@ MONEY_CATEGORIES = [
 KINDS = {"dsa": "DSA problems", "money": "Money log", "generic": "General task"}
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.secret_key = None  # set in configure(): Workers forbid randomness at import time
 app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_HTTPONLY=True,
@@ -155,34 +195,26 @@ ALTER TABLE outbox ENABLE ROW LEVEL SECURITY;
 """
 
 
-# prepare_threshold=None: Supabase's transaction pooler (port 6543) doesn't support prepared statements.
-CONN_KWARGS = {"row_factory": dict_row, "autocommit": True, "prepare_threshold": None}
-_pool = None
-
-
-def conninfo():
-    if not DATABASE_URL:
-        raise SystemExit("Set DATABASE_URL in .env (Supabase > Connect > Session pooler)")
-    # Supabase only accepts TLS connections.
-    return DATABASE_URL if "sslmode=" in DATABASE_URL else DATABASE_URL + ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
-
-
 def connect():
-    return psycopg.connect(conninfo(), **CONN_KWARGS)
-
-
-def pool():
-    """A few long-lived connections: opening a TLS connection to Supabase per request is slow."""
-    global _pool
-    if _pool is None:
-        _pool = ConnectionPool(conninfo(), kwargs=CONN_KWARGS, min_size=1, max_size=4, max_idle=300,
-                               check=ConnectionPool.check_connection, open=True)
-    return _pool
+    """New connection. In the Worker it goes through Hyperdrive (which pools and keeps TLS to Supabase)."""
+    hd = getattr(WORKER_ENV, "HYPERDRIVE", None) if WORKER_ENV is not None else None
+    if hd is not None:
+        conn = pg8000.dbapi.connect(host=hd.host, port=int(hd.port), user=hd.user, password=hd.password,
+                                    database=hd.database, ssl_context=False)
+    else:
+        url = urlsplit(setting("DATABASE_URL"))
+        if not url.hostname:
+            raise SystemExit("Set DATABASE_URL (Supabase > Connect > Session pooler)")
+        conn = pg8000.dbapi.connect(host=url.hostname, port=url.port or 5432, user=unquote(url.username),
+                                    password=unquote(url.password or ""), database=url.path.lstrip("/") or "postgres",
+                                    ssl_context="sslmode=disable" not in (url.query or ""))
+    conn.autocommit = True
+    return conn
 
 
 def db():
     if "db" not in g:
-        g.db = pool().getconn()
+        g.db = connect()
     return g.db
 
 
@@ -190,68 +222,66 @@ def db():
 def close_db(_exc):
     conn = g.pop("db", None)
     if conn is not None:
-        pool().putconn(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
-def q(sql, params=None):
-    cur = db().execute(sql, params)
-    return cur.fetchall() if cur.description else []
+def run(conn, sql, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, tuple(params))
+    if cur.description is None:
+        return []
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def q1(sql, params=None):
+def q(sql, params=()):
+    return run(db(), sql, params)
+
+
+def q1(sql, params=()):
     rows = q(sql, params)
     return rows[0] if rows else None
 
 
-@app.cli.command("init-db")
-def init_db_command():
-    """Create tables (waiting for Postgres to come up) and the admin account."""
-    for _ in range(30):
-        try:
-            conn = connect()
-            break
-        except psycopg.OperationalError as exc:
-            click.echo(f"waiting for database... ({str(exc).strip().splitlines()[0]})")
-            time.sleep(2)
-    else:
-        raise SystemExit("Could not connect to Supabase. Check DATABASE_URL (use the Session pooler string).")
-    with conn:
-        conn.execute(SCHEMA)
-        username = os.environ.get("ADMIN_USERNAME", "admin").lower()
-        password = os.environ.get("ADMIN_PASSWORD")
+def init_db():
+    """Create tables and the admin/member accounts. Run once from your computer: python src/app.py init-db"""
+    conn = connect()
+    sql = "\n".join(line for line in SCHEMA.splitlines() if not line.strip().startswith("--"))
+    for statement in sql.split(";"):
+        if statement.strip():
+            run(conn, statement.strip())
+    username = setting("ADMIN_USERNAME", "admin").lower()
+    password = setting("ADMIN_PASSWORD")
+    if not run(conn, "SELECT 1 FROM users WHERE username = %s", (username,)):
         if not password:
-            raise SystemExit("Set ADMIN_PASSWORD in .env")
-        if conn.execute("SELECT 1 FROM users WHERE username = %s", (username,)).fetchone() is None:
-            conn.execute(
-                "INSERT INTO users (name, email, username, password_hash, is_admin) VALUES (%s, %s, %s, %s, TRUE)",
-                ("Admin", os.environ.get("ADMIN_EMAIL", ""), username, generate_password_hash(password)),
-            )
-            click.echo(f"created admin user '{username}'")
-        seed_member(conn)
-    click.echo("database ready")
+            raise SystemExit("Set ADMIN_PASSWORD")
+        run(conn, "INSERT INTO users (name, email, username, password_hash, is_admin) VALUES (%s, %s, %s, %s, TRUE)",
+            ("Admin", setting("ADMIN_EMAIL"), username, hash_password(password)))
+        print(f"created admin user '{username}'")
+    seed_member(conn)
+    conn.close()
+    print("database ready")
 
 
 def seed_member(conn):
-    """Optionally create the first member (with DSA + money tasks) from .env. No email is sent."""
-    email = os.environ.get("MEMBER_EMAIL", "").strip()
-    username = os.environ.get("MEMBER_USERNAME", "").strip().lower()
+    """Optionally create the first member (with DSA + money tasks) from MEMBER_* settings. No email is sent."""
+    email, username = setting("MEMBER_EMAIL"), setting("MEMBER_USERNAME").lower()
     if not email or not username:
         return
-    if conn.execute("SELECT 1 FROM users WHERE lower(username) = %s OR lower(email) = lower(%s)",
-                    (username, email)).fetchone():
+    if run(conn, "SELECT 1 FROM users WHERE lower(username) = %s OR lower(email) = lower(%s)", (username, email)):
         return
-    member = conn.execute(
-        "INSERT INTO users (name, email, username, password_hash) VALUES (%s, %s, %s, %s) RETURNING id",
-        (os.environ.get("MEMBER_NAME", username), email, username, generate_password_hash(secrets.token_urlsafe(16))),
-    ).fetchone()
-    conn.execute(
-        """INSERT INTO tasks (user_id, name, kind, description, remind_at, min_count, start_day) VALUES
-           (%(id)s, 'DSA practice', 'dsa', 'Solve and explain at least 2 problems', '20:00', 2, %(day)s),
-           (%(id)s, 'Money log', 'money', 'Log every rupee in or out, then close the day', '21:30', 1, %(day)s)""",
-        {"id": member["id"], "day": today()},
-    )
-    click.echo(f"created member '{username}' <{email}> with DSA + Money tasks "
-               "(send the login email from the admin page)")
+    member = run(conn, "INSERT INTO users (name, email, username, password_hash) VALUES (%s, %s, %s, %s) RETURNING id",
+                 (setting("MEMBER_NAME", username), email, username, hash_password(secrets.token_urlsafe(16))))[0]
+    for name, kind, desc, remind, count in [
+        ("DSA practice", "dsa", "Solve and explain at least 2 problems", "20:00", 2),
+        ("Money log", "money", "Log every rupee in or out, then close the day", "21:30", 1),
+    ]:
+        run(conn, """INSERT INTO tasks (user_id, name, kind, description, remind_at, min_count, start_day)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s)""", (member["id"], name, kind, desc, remind, count, today()))
+    print(f"created member '{username}' <{email}> with DSA + Money tasks (send the login email from the admin page)")
 
 
 # ---------------------------------------------------------------- time helpers
@@ -287,13 +317,13 @@ def counts_for(tasks, since):
     ids = [t["id"] for t in tasks]
     if not ids:
         return {}
+    tables = ("dsa_logs", "money_days", "task_logs")
     rows = q(
         " UNION ALL ".join(
-            f"SELECT task_id, day, COUNT(*) AS n FROM {table}"
-            " WHERE task_id = ANY(%(ids)s) AND day >= %(since)s GROUP BY 1, 2"
-            for table in ("dsa_logs", "money_days", "task_logs")
+            f"SELECT task_id, day, COUNT(*) AS n FROM {table} WHERE task_id = ANY(%s) AND day >= %s GROUP BY 1, 2"
+            for table in tables
         ),
-        {"ids": ids, "since": since},
+        (ids, since) * len(tables),
     )
     return {(r["task_id"], r["day"]): r["n"] for r in rows}
 
@@ -325,6 +355,15 @@ def task_status(tasks, grid_days=14):
 
 
 # ---------------------------------------------------------------- auth
+
+
+# Cloudflare's WebCrypto caps PBKDF2 at 100,000 iterations, and scrypt isn't available in Workers.
+PASSWORD_METHOD = "pbkdf2:sha256:100000"
+
+
+def hash_password(password):
+    return generate_password_hash(password, method=PASSWORD_METHOD)
+
 
 
 @app.before_request
@@ -371,7 +410,6 @@ def login():
             session.permanent = True
             session["user_id"] = user["id"]
             return redirect(url_for("home"))
-        time.sleep(1)
         flash("Wrong username or password.", "error")
     return render_template("login.html")
 
@@ -392,7 +430,7 @@ def account():
         elif len(new) < 6:
             flash("New password needs at least 6 characters.", "error")
         else:
-            q("UPDATE users SET password_hash = %s WHERE id = %s", (generate_password_hash(new), g.user["id"]))
+            q("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(new), g.user["id"]))
             flash("Password changed.", "ok")
             return redirect(url_for("home"))
     return render_template("account.html")
@@ -643,8 +681,6 @@ def queue_email(key, to, subject, body, link="", expires_at=None):
     added = q("""INSERT INTO outbox (dedupe_key, to_email, subject, body, link, expires_at)
                  VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING RETURNING id""",
               (key, to, subject, body, link, expires_at))
-    if added:
-        mail_wakeup.set()  # send it now instead of at the next minute
     return True
 
 
@@ -696,7 +732,7 @@ def admin_create_member():
             flash(e, "error")
         return redirect(url_for("admin_home"))
     member = q1("INSERT INTO users (name, email, username, password_hash) VALUES (%s, %s, %s, %s) RETURNING *",
-                (name, email, username, generate_password_hash(password)))
+                (name, email, username, hash_password(password)))
     session[f"pw:{member['id']}"] = password  # kept until the login email is sent
     flash(f"{name} added. Next: add what they must log, then send the login email.", "ok")
     return redirect(url_for("admin_member", member_id=member["id"]))
@@ -736,10 +772,12 @@ def admin_send_login(member_id):
     password = session.pop(f"pw:{member_id}", None)
     if password is None:
         password = new_password()
-        q("UPDATE users SET password_hash = %s WHERE id = %s", (generate_password_hash(password), member_id))
+        q("UPDATE users SET password_hash = %s WHERE id = %s", (hash_password(password), member_id))
     q("UPDATE users SET login_sent_at = now() WHERE id = %s", (member_id,))
     queue_login_email(member, password)
-    flash(f"Login email for {member['email']} is on its way (password: {password}).", "ok")
+    send_now()
+    flash(f"Login email for {member['email']} queued (password: {password}). "
+          "The Email section on the Members page shows whether it was sent.", "ok")
     return redirect(url_for("admin_member", member_id=member_id))
 
 
@@ -812,7 +850,8 @@ def admin_test_email():
     else:
         queue_email(f"test:{secrets.token_hex(6)}", to, f"{APP_NAME}: test email",
                     "If you can read this, the Apps Script mailer is working.", f"{BASE_URL}/")
-        flash(f"Test email to {to} is on its way. Refresh in a few seconds to see if it was sent.", "ok")
+        send_now()
+        flash(f"Test email to {to} queued. See below whether it was sent.", "ok")
     return redirect(url_for("admin_home"))
 
 
@@ -820,7 +859,6 @@ def admin_test_email():
 
 MAX_ATTEMPTS = 10
 SENDABLE = f"sent_at IS NULL AND attempts < {MAX_ATTEMPTS} AND (expires_at IS NULL OR expires_at > now())"
-mail_wakeup = threading.Event()
 
 
 def queue_due_reminders():
@@ -851,10 +889,18 @@ def queue_due_reminders():
 def post_to_apps_script(msg):
     payload = json.dumps({"to": msg["to_email"], "subject": msg["subject"], "body": msg["body"],
                           "link": msg["link"]}).encode()
-    req = urllib.request.Request(APPS_SCRIPT_URL, data=payload, headers={"Content-Type": "application/json"})
-    # Apps Script answers a POST with a redirect to the result; urllib follows it with a GET.
-    with urllib.request.urlopen(req, timeout=30) as res:
-        text_body = res.read().decode("utf-8", "replace")
+    # Apps Script answers a POST with a redirect to the result; both fetch and urllib follow it with a GET.
+    if IN_WORKER:
+        from pyodide.ffi import run_sync
+        from pyodide.http import pyfetch
+
+        res = run_sync(pyfetch(APPS_SCRIPT_URL, method="POST", headers={"Content-Type": "application/json"},
+                               body=payload.decode()))
+        text_body = run_sync(res.string())
+    else:
+        req = urllib.request.Request(APPS_SCRIPT_URL, data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as res:
+            text_body = res.read().decode("utf-8", "replace")
     try:
         result = json.loads(text_body)
     except ValueError:
@@ -884,26 +930,45 @@ def deliver_outbox():
             app.logger.warning("mailer: #%s failed (attempt %s): %s", msg["id"], msg["attempts"], exc)
 
 
-def mailer_loop():
-    if not APPS_SCRIPT_URL:
-        app.logger.warning("mailer: APPS_SCRIPT_URL is not set, emails will wait in the outbox")
-    while True:
+def run_scheduled_jobs():
+    """Called by the Worker's cron trigger every minute."""
+    with app.app_context():
+        queue_due_reminders()
+        if APPS_SCRIPT_URL:
+            deliver_outbox()
+
+
+def send_now():
+    """Try to deliver right away (login/test emails); the cron retries anything that fails."""
+    if APPS_SCRIPT_URL:
         try:
-            with app.app_context():
-                queue_due_reminders()
-                if APPS_SCRIPT_URL:
-                    deliver_outbox()
+            deliver_outbox()
         except Exception as exc:
             app.logger.warning("mailer: %s", exc)
-        mail_wakeup.wait(60)  # check every minute, or right away when an email is queued
-        mail_wakeup.clear()
-
-
-def start_mailer():
-    threading.Thread(target=mailer_loop, name="mailer", daemon=True).start()
 
 
 @app.route("/healthz")
 def healthz():
     q("SELECT 1")
     return "ok"
+
+
+def set_password(username, password):
+    conn = connect()
+    rows = run(conn, "UPDATE users SET password_hash = %s WHERE lower(username) = lower(%s) RETURNING username",
+               (hash_password(password), username))
+    conn.close()
+    print(f"password updated for '{username}'" if rows else f"no user '{username}'")
+
+
+if __name__ == "__main__":
+    configure()
+    if sys.argv[1:] == ["init-db"]:
+        init_db()
+    elif len(sys.argv) == 3 and sys.argv[1] == "set-password":
+        import getpass
+        set_password(sys.argv[2], os.environ.get("NEW_PASSWORD") or getpass.getpass("New password: "))
+    else:
+        print("usage: python src/app.py init-db\n"
+              "       python src/app.py set-password USERNAME   (NEW_PASSWORD env or prompt)\n"
+              "Reads DATABASE_URL, ADMIN_*, MEMBER_* from the environment.")

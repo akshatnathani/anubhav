@@ -1,0 +1,4 @@
+# For `npm run dev` (local Worker). Copy to .dev.vars.
+SECRET_KEY=local-dev-secret
+APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXXXXXX/exec
+BASE_URL=http://localhost:8787

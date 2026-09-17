@@ -1,0 +1,11 @@
+{
+  "name": "anubhav-tracker",
+  "private": true,
+  "scripts": {
+    "dev": "uv run pywrangler dev",
+    "deploy": "uv run pywrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.134.0"
+  }
+}

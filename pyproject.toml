@@ -1,0 +1,16 @@
+[project]
+name = "anubhav-tracker"
+version = "0.2.0"
+description = "Daily accountability tracker on Cloudflare Python Workers + Supabase"
+requires-python = ">=3.12"
+dependencies = [
+    "flask",
+    "pg8000",
+    "tzdata",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]
